@@ -1,0 +1,291 @@
+function [t_out, Vout] = simulate_circuit(netlist_file, tf)
+% SIMULATE_CIRCUIT - Numeric MNA solver with R, L, C, V, I support
+%   tf == 0 -> DC analysis (C open, L short)
+%   tf  > 0 -> transient using Backward Euler (BE)
+%   tf  < 0 -> AC analysis (returns complex node voltages at specified frequencies)
+
+%% Read file (same as original)
+fid = fopen(netlist_file, 'r');
+if fid < 0
+    error('Could not open netlist file: %s', netlist_file);
+end
+raw = textscan(fid, '%s', 'Delimiter', '\n');
+fclose(fid);
+lines = raw{1};
+
+% Storage
+R = []; Cc = []; L = []; V = []; I = [];
+maxNode = 0;
+
+% Parse lines
+for k = 1:numel(lines)
+    line = strtrim(lines{k});
+    if isempty(line) || line(1) == '*' || line(1) == '%'
+        continue;
+    end
+    parts = regexp(line, '\s+', 'split');
+    if numel(parts) < 4
+        continue;
+    end
+    name = parts{1};
+    n1 = round(str2double(parts{2}));
+    n2 = round(str2double(parts{3}));
+    % Note: For AC, voltage/current sources must specify magnitude/phase.
+    % Assuming 'value' is magnitude and phase is 0 for simplicity here.
+    val = str2double(parts{4});
+    maxNode = max([maxNode, n1, n2]);
+
+    t = upper(name(1));
+    switch t
+        case 'R'
+            R(end+1,:) = [n1 n2 val];
+        case 'C'
+            Cc(end+1,:) = [n1 n2 val];
+        case 'L'
+            L(end+1,:) = [n1 n2 val];
+        case 'V'
+            V(end+1,:) = [n1 n2 val];
+        case 'I'
+            I(end+1,:) = [n1 n2 val];
+        otherwise
+            warning('Unknown element "%s" — skipping', name);
+    end
+end
+
+N = maxNode;          % # node unknowns (nodes 1..N)
+Mv = size(V,1);       % # voltage sources
+Ml = size(L,1);       % # inductors (for MNA, inductors are handled as admittance now)
+
+%% Quick trivial return
+if N == 0 && Mv == 0
+    t_out = 0;
+    Vout = zeros(0,1);
+    return;
+end
+
+% --- Common Matrix Setup (G and C) ---
+G = zeros(N,N);        % conductance matrix (R only)
+Cmat = zeros(N,N);     % capacitance matrix
+Bv = zeros(N,Mv);      % incidence for voltage sources
+Vs = zeros(Mv,1);
+Iinj = zeros(N,1);     % current injections (I source magnitudes)
+
+% stamp resistors (G)
+for k = 1:size(R,1)
+    n1 = R(k,1); n2 = R(k,2); val = R(k,3);
+    g = 1/val;
+    if n1~=0, G(n1,n1) = G(n1,n1) + g; end
+    if n2~=0, G(n2,n2) = G(n2,n2) + g; end
+    if n1~=0 && n2~=0
+        G(n1,n2) = G(n1,n2) - g;
+        G(n2,n1) = G(n2,n1) - g;
+    end
+end
+
+% stamp capacitors (Cmat)
+for k = 1:size(Cc,1)
+    n1 = Cc(k,1); n2 = Cc(k,2); val = Cc(k,3);
+    if n1~=0, Cmat(n1,n1) = Cmat(n1,n1) + val; end
+    if n2~=0, Cmat(n2,n2) = Cmat(n2,n2) + val; end
+    if n1~=0 && n2~=0
+        Cmat(n1,n2) = Cmat(n1,n2) - val;
+        Cmat(n2,n1) = Cmat(n2,n1) - val;
+    end
+end
+
+% stamp voltage sources (Bv, Vs)
+for k = 1:Mv
+    n1 = V(k,1); n2 = V(k,2); val = V(k,3);
+    Vs(k) = val; % Magnitude (assuming 0 phase)
+    if n1~=0, Bv(n1,k) = 1; end
+    if n2~=0, Bv(n2,k) = -1; end
+end
+
+% current source injections (Iinj)
+for k = 1:size(I,1)
+    n1 = I(k,1); n2 = I(k,2); val = I(k,3);
+    if n1~=0, Iinj(n1) = Iinj(n1) - val; end
+    if n2~=0, Iinj(n2) = Iinj(n2) + val; end
+end
+
+% --- Inductor Admittance Setup (used in AC) ---
+YL = zeros(N,N); % Admittance matrix for Inductors (L)
+L_data = [];
+for k = 1:size(L,1)
+    n1 = L(k,1); n2 = L(k,2); val = L(k,3);
+    L_data(end+1,:) = [n1 n2 val];
+end
+
+%% DC SOLVE (tf == 0)
+if tf == 0
+    % DC MNA uses G_dc where L is short (bigG) and C is open (ignored).
+    G_dc = G;
+    bigG = 1e9; % very large conductance to mimic short
+    for k = 1:size(L_data,1)
+        n1 = L_data(k,1); n2 = L_data(k,2);
+        g = bigG;
+        if n1~=0, G_dc(n1,n1) = G_dc(n1,n1) + g; end
+        if n2~=0, G_dc(n2,n2) = G_dc(n2,n2) + g; end
+        if n1~=0 && n2~=0
+            G_dc(n1,n2) = G_dc(n1,n2) - g;
+            G_dc(n2,n1) = G_dc(n2,n1) - g;
+        end
+    end
+    
+    A = [G_dc, Bv; Bv', zeros(Mv,Mv)];
+    z = [Iinj; Vs]; % Vs is the DC value here
+
+    if rcond(A) < 1e-14
+        error('DC MNA matrix singular or ill-conditioned. Check for floating nodes or shorts.');
+    end
+
+    x = A \ z;
+    Vnodes = x(1:N);
+
+    t_out = 0;
+    Vout = Vnodes(:);
+    return;
+end
+
+%% AC ANALYSIS (tf < 0) - Frequency Sweep
+if tf < 0
+    % Define frequency range for sweep
+    f_start = 1; % 1 Hz
+    f_end = 1e6; % 1 MHz
+    num_points = 100;
+    f_vec = logspace(log10(f_start), log10(f_end), num_points);
+    
+    Vout_mag = zeros(num_points, N); % Magnitude of node voltages
+    Vout_phase = zeros(num_points, N); % Phase of node voltages
+
+    for k_f = 1:num_points
+        f = f_vec(k_f);
+        omega = 2 * pi * f;
+        s = 1i * omega; % Complex frequency s = jw
+        
+        % Reset YL for new frequency
+        YL = zeros(N,N);
+        for k = 1:size(L_data,1)
+            n1 = L_data(k,1); n2 = L_data(k,2); val = L_data(k,3);
+            % Inductor admittance Y = 1 / (sL) = 1 / (jwL)
+            y = 1 / (s * val); 
+            if n1~=0, YL(n1,n1) = YL(n1,n1) + y; end
+            if n2~=0, YL(n2,n2) = YL(n2,n2) + y; end
+            if n1~=0 && n2~=0
+                YL(n1,n2) = YL(n1,n2) - y;
+                YL(n2,n1) = YL(n2,n1) - y;
+            end
+        end
+
+        % A11 = G + s*C + YL
+        A11_AC = G + s * Cmat + YL;
+        
+        A_AC = [A11_AC, Bv; Bv', zeros(Mv,Mv)];
+        z_AC = [Iinj; Vs]; % Sources are complex phasors (Vs, Iinj are magnitudes here)
+
+        % Solve for complex node voltages
+        X_AC = A_AC \ z_AC;
+        Vnodes_complex = X_AC(1:N);
+        
+        Vout_mag(k_f, :) = abs(Vnodes_complex(:)).';
+        Vout_phase(k_f, :) = angle(Vnodes_complex(:)).';
+    end
+
+    % Return frequency vector and Magnitude/Phase matrices
+    t_out = f_vec(:);
+    % Vout is a cell array to hold both magnitude and phase
+    Vout = {Vout_mag, Vout_phase}; 
+    return;
+end
+
+%% TRANSIENT (tf > 0) — Full RLC using BE (Backward Euler)
+% ... (Remaining transient code, unchanged from your original file) ...
+% Time stepping parameters
+max_steps = 2000;
+dt = tf / max_steps;
+steps = max_steps;
+% State arrays
+v = zeros(N,1);
+i_vs = zeros(Mv,1);
+i_l  = zeros(Ml,1);
+% previous states for BE
+v_prev = v;
+i_l_prev = i_l;
+
+% Build constant matrices (already done above: G, Cmat, Bv, Vs, Iinj)
+
+% stamp inductors: build incidence Bl and L diag
+Bl = zeros(N,Ml);
+Lvals = zeros(Ml,1);
+for k = 1:Ml
+    n1 = L(k,1); n2 = L(k,2); val = L(k,3);
+    Lvals(k) = val;
+    if n1~=0, Bl(n1,k) = 1; end
+    if n2~=0, Bl(n2,k) = -1; end
+end
+
+% Precompute BE coefficients
+Cdtd = Cmat / dt;       % C/dt
+Ldt_inv = zeros(Ml,1);  % L/dt for each inductor -> denom for KVL of inductor
+for k = 1:Ml
+    Ldt_inv(k) = Lvals(k) / dt;
+end
+Ldt_inv_diag = diag(Ldt_inv);
+
+% Build time-invariant left-hand-block for BE:
+A11 = G + Cdtd;
+A12 = Bv;
+A13 = Bl;
+A21 = Bv';
+A22 = zeros(Mv, Mv);
+A23 = zeros(Mv, Ml);
+A31 = Bl';
+A32 = zeros(Ml, Mv);
+A33 = -Ldt_inv_diag;
+
+A_top = [A11, A12, A13];
+A_mid = [A21, A22, A23];
+A_bot = [A31, A32, A33];
+A_BE = [A_top; A_mid; A_bot];
+
+% Prepare RHS templates
+% Pre-allocate outputs
+Vout = zeros(steps, N);
+t_out = (0:steps-1) * dt;
+
+% Time stepping loop
+v = v_prev;
+i_l = i_l_prev;
+i_vs = zeros(Mv,1);
+
+for step = 1:steps
+    rhs1 = Iinj + Cdtd * v;           % Iinj is used directly (constant)
+    rhs2 = Vs;                              
+    rhs3 = -Ldt_inv_diag * i_l;             
+    rhs = [rhs1; rhs2; rhs3];
+
+    % Solve linear system
+    if rcond(A_BE) < 1e-15
+        error('Transient matrix singular or ill-conditioned. Check circuit.');
+    end
+    X = A_BE \ rhs;
+
+    % extract states
+    v_new = X(1:N);
+    i_vs_new = X(N+1:N+Mv);
+    i_l_new = X(N+Mv+1:end);
+
+    % save for next step
+    v = v_new;
+    i_vs = i_vs_new;
+    i_l = i_l_new;
+
+    Vout(step, :) = v(:).';
+end
+
+% Return results
+if steps == 1
+    Vout = Vout(:).';
+end
+
+end
